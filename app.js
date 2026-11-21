@@ -14,7 +14,7 @@ const session = require("express-session");
 const SequelizeStore = require("connect-session-sequelize")(session.Store);
 const sessionStore = new SequelizeStore({ db });
 
-const PORT = 8080;
+const PORT = process.env.PORT || 8080;
 
 //setup middleware
 app.use(express.json());
@@ -153,9 +153,32 @@ app.get("/github/logout", async (req, res, next) => {
 //mounting on routes
 app.use("/api", require("./api"));
 
-// 404 Handling - This route should be at the end to handle unknown routes
+// Error handler - turns GitHub errors into clear JSON responses
 app.use((error, req, res, next) => {
-  res.status(error.status || 500).send(error.message);
+  let status = error.status || 500;
+  let message = error.message || "Internal Server Error";
+
+  if (status === 401 && error.response) {
+    // GitHub rejected the stored token (revoked/expired) - user must log in again
+    message = "GitHub token is invalid or expired. Please log out and log in again.";
+  } else if (
+    (status === 403 || status === 429) &&
+    error.response &&
+    error.response.headers &&
+    error.response.headers["x-ratelimit-remaining"] === "0"
+  ) {
+    status = 429;
+    message = "GitHub API rate limit reached. Try again in a few minutes.";
+  }
+
+  if (status >= 500) console.error("Unhandled route error:", error);
+  if (res.headersSent) return next(error);
+  res.status(status).json({ error: message });
+});
+
+// Log instead of crashing the whole server on a stray async error
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection:", reason);
 });
 
 //Run server function
