@@ -1,352 +1,141 @@
-const router=require("express").Router();
+const router = require("express").Router();
 const octokitMain = require("../services/octokit");
-const authenticateUser=require("../middleware/auth")
+const authenticateUser = require("../middleware/auth");
+const { paginateLimited, getRepoCounts, cached, userKey } = require("../services/github");
 
-// mounted on: http://localhost:8080/api/issues
+// mounted on: /api/issues
+//
+// Note: GitHub's REST /issues endpoint also returns pull requests. These routes
+// count real issues only.
 
 // get number of issues linked to repository
-// ex: 
-// reponse object : {
-    //     openIssues: 3,
-    //     closedIssues: 5,
-    //     allIssues: 8
-    // }
-router.get("/:owner/:repo/count/getNum",authenticateUser,async(req,res,next)=>{
-    try {
-        const { owner, repo } = req.params;
-            
-        const octokit =  octokitMain(req.user.githubAccessToken)
-        const responseClosed = await octokit.paginate('GET /repos/:owner/:repo/issues?state=closed', {
-            owner,
-            repo,
-            per_page: 100,
-        });
-        const numClosed = responseClosed.length;
+// ex: { issues: { numOpen: 3, numClosed: 5, numAll: 8 } }
+router.get("/:owner/:repo/count/getNum", authenticateUser, async (req, res, next) => {
+  try {
+    const { owner, repo } = req.params;
+    const octokit = octokitMain(req.user.githubAccessToken);
+    const counts = await getRepoCounts(req, octokit, owner, repo);
+    res.json({
+      issues: {
+        numOpen: counts.openIssues,
+        numClosed: counts.closedIssues,
+        numAll: counts.openIssues + counts.closedIssues,
+      },
+    });
+  } catch (error) {
+    console.log("Error in retrieving num of issues", error.message);
+    next(error);
+  }
+});
 
-        const responseOpen = await octokit.paginate('GET /repos/:owner/:repo/issues?state=open', {
-            owner,
-            repo,
-            per_page: 100,
-        });
-        const numOpen = responseOpen.length;
-        
+// Timeline of how many issues were open / closed at each point in the past.
+//
+// Instead of downloading every issue the repo ever had, start from today's
+// totals and "rewind" using only the issues that changed during the period
+// (GitHub's `since` filter returns issues updated after a date, which includes
+// every issue created or closed in that window).
+const TIMELINES = {
+  pastWeek: { buckets: 8, stepDays: 1, label: "days" },
+  pastMonth: { buckets: 5, stepDays: 7, label: "weeks" },
+  pastYear: { buckets: 13, stepDays: 30, label: "months" },
+};
 
-        const responseAll = await octokit.paginate('GET /repos/:owner/:repo/issues?state=all', {
-            owner,
-            repo,
-            per_page: 100,
-        });
-        const numAll = numOpen + numClosed;
-        
-        res.json({
-            issues: {
-                numOpen,
-                numClosed,
-                numAll
-            }
-        });
-    } catch (error) {
-        console.log("Error in retrieving num of issues",error)
-        next(error);
-    }
-})
+router.get("/:owner/:repo/timeline/:timeRange", authenticateUser, async (req, res, next) => {
+  const config = TIMELINES[req.params.timeRange];
+  if (!config) return next(); // fall through to /:owner/:repo/:state etc.
 
-//get timesline of issues (open/closed/all) over the past month
-//ex response object: 
-// {
-//     "0 weeks ago": {
-//         "closed": 19,
-//         "open": 3,
-//         "all": 19
-//     },
-//     "1 weeks ago": {
-//         "all": 0,
-//         "closed": 0,
-//         "open": 0
-//     },
-//     "2 weeks ago": {
-//         "all": 0,
-//         "closed": 0,
-//         "open": 0
-//     },
-//     "3 weeks ago": {
-//         "all": 0,
-//         "closed": 0,
-//         "open": 0
-//     },
-//     "4 weeks ago": {
-//         "all": 0,
-//         "closed": 0,
-//         "open": 0
-//     }
-// }
-router.get("/:owner/:repo/timeline/pastMonth",authenticateUser,async(req,res,next)=>{
-    try {
-        const { owner, repo } = req.params;
-        const octokit= octokitMain(req.user.githubAccessToken)
-        const responseAll = await octokit.paginate('GET /repos/:owner/:repo/issues?state=all', {
-            owner,
-            repo,
-            per_page: 100,
-        });
-        
-        const toDate = new Date();
-        
-        const issuesPerWeekObject = {
-            "0 weeks ago" : {},
-            "1 weeks ago" : {},
-            "2 weeks ago" : {},
-            "3 weeks ago" : {},
-            "4 weeks ago" : {},
-        };
-        let weeksAgo = 0;
-        
-        while (weeksAgo <=  4){
-            responseAll.map(issue => {
-                issueCreationDate = new Date(issue.created_at);
-                
-                if (issueCreationDate <= toDate){
-                    if (issue.state === "closed" && new Date (issue.closed_at) <= toDate ) {
-                        if ("closed" in issuesPerWeekObject[`${weeksAgo} weeks ago`]){
-                            issuesPerWeekObject[`${weeksAgo} weeks ago`].closed++;
-                        }
-                        else {
-                            issuesPerWeekObject[`${weeksAgo} weeks ago`].closed = 1;
-                        }
-                    }
-                    else{
-                        if ("open" in issuesPerWeekObject[`${weeksAgo} weeks ago`]){
-                            issuesPerWeekObject[`${weeksAgo} weeks ago`].open++;
-                        }
-                        else {
-                            issuesPerWeekObject[`${weeksAgo} weeks ago`].open = 1;
-                        }
-                    }
-                }
-                
-            }) //end map
-            issuesPerWeekObject[`${weeksAgo} weeks ago`].all = 
-            (issuesPerWeekObject[`${weeksAgo} weeks ago`].closed || 0) + 
-            (issuesPerWeekObject[`${weeksAgo} weeks ago`].open || 0);
-            
-            !issuesPerWeekObject[`${weeksAgo} weeks ago`].closed 
-            ? issuesPerWeekObject[`${weeksAgo} weeks ago`].closed = 0 
-            : null
-            
-            !issuesPerWeekObject[`${weeksAgo} weeks ago`].open 
-            ? issuesPerWeekObject[`${weeksAgo} weeks ago`].open = 0 
-            : null
-            
-            weeksAgo++;
-            toDate.setDate(toDate.getDate() - 7);
+  try {
+    const { owner, repo, timeRange } = req.params;
+    const octokit = octokitMain(req.user.githubAccessToken);
+
+    const result = await cached(userKey(req, "issues-timeline", owner, repo, timeRange), async () => {
+      const counts = await getRepoCounts(req, octokit, owner, repo);
+
+      const now = new Date();
+      const bucketDates = [];
+      for (let i = 0; i < config.buckets; i++) {
+        const d = new Date(now);
+        d.setDate(d.getDate() - i * config.stepDays);
+        bucketDates.push(d);
+      }
+      const earliest = bucketDates[bucketDates.length - 1];
+
+      const changed = (
+        await paginateLimited(
+          octokit,
+          "GET /repos/{owner}/{repo}/issues",
+          { owner, repo, state: "all", since: earliest.toISOString() },
+          10
+        )
+      ).filter((issue) => !issue.pull_request);
+
+      const result = {};
+      bucketDates.forEach((date, i) => {
+        let open = counts.openIssues;
+        let closed = counts.closedIssues;
+
+        for (const issue of changed) {
+          const created = new Date(issue.created_at);
+          const closedAt = issue.closed_at ? new Date(issue.closed_at) : null;
+
+          // remove the issue from today's totals...
+          if (issue.state === "closed") closed--;
+          else open--;
+
+          // ...and add it back as it was at `date`
+          if (created <= date) {
+            if (closedAt && closedAt <= date) closed++;
+            else open++;
+          }
         }
-        
-        res.json(issuesPerWeekObject);
-    } catch (error) {
-        console.log("Error in retrieving issue timeline",error)
-        next(error);
-    }
-})
-                        
-//get timesline of issues (open/closed/all) over the past year
-router.get("/:owner/:repo/timeline/pastYear",authenticateUser,async(req,res,next)=>{
-                            console.log("hit");
-                            try {
-                                const { owner, repo } = req.params;
-                                const octokit= octokitMain(req.user.githubAccessToken)
-                                const responseAll = await octokit.paginate('GET /repos/:owner/:repo/issues?state=all', {
-                                    owner,
-                                    repo,
-                                    per_page: 100,
-                                });
-                                
-                                const toDate = new Date();
-                                
-                                const issuesPerMonthObject = {
-                                    "0 months ago" : {},
-                                    "1 months ago" : {},
-                                    "2 months ago" : {},
-                                    "3 months ago" : {},
-                                    "4 months ago" : {},
-                                    "5 months ago" : {},
-                                    "6 months ago" : {},
-                                    "7 months ago" : {},
-            "8 months ago" : {},
-            "9 months ago" : {},
-            "10 months ago" : {},
-            "11 months ago" : {},
-            "12 months ago" : {},
-        };
-        let monthsAgo = 0;
 
-        while (monthsAgo <=  12){
-            responseAll.map(issue => {
-                issueCreationDate = new Date(issue.created_at);
-        
-                if (issueCreationDate <= toDate){
-                    if (issue.state === "closed" && new Date (issue.closed_at) <= toDate ) {
-                        if ("closed" in issuesPerMonthObject[`${monthsAgo} months ago`]){
-                            issuesPerMonthObject[`${monthsAgo} months ago`].closed++;
-                        }
-                        else {
-                            issuesPerMonthObject[`${monthsAgo} months ago`].closed = 1;
-                        }
-                    }
-                    else{
-                        if ("open" in issuesPerMonthObject[`${monthsAgo} months ago`]){
-                            issuesPerMonthObject[`${monthsAgo} months ago`].open++;
-                        }
-                        else {
-                            issuesPerMonthObject[`${monthsAgo} months ago`].open = 1;
-                        }
-                    }
-                }
+        open = Math.max(open, 0);
+        closed = Math.max(closed, 0);
+        result[`${i} ${config.label} ago`] = { open, closed, all: open + closed };
+      });
+      return result;
+    });
 
-            }) //end map
+    res.json(result);
+  } catch (error) {
+    console.log("Error in retrieving issue timeline", error.message);
+    next(error);
+  }
+});
 
-            issuesPerMonthObject[`${monthsAgo} months ago`].all = 
-            (issuesPerMonthObject[`${monthsAgo} months ago`].closed || 0)
-            + (issuesPerMonthObject[`${monthsAgo} months ago`].open || 0);
+// get the most recent issues (capped at 300) --> state = open, closed, OR all
+router.get("/:owner/:repo/:state", authenticateUser, async (req, res, next) => {
+  try {
+    const { owner, repo, state } = req.params;
+    const octokit = octokitMain(req.user.githubAccessToken);
+    const issues = await paginateLimited(
+      octokit,
+      "GET /repos/{owner}/{repo}/issues",
+      { owner, repo, state },
+      3
+    );
+    res.json({ issues: issues.filter((issue) => !issue.pull_request) });
+  } catch (error) {
+    console.log("Error in retrieving issues", error.message);
+    next(error);
+  }
+});
 
-            !issuesPerMonthObject[`${monthsAgo} months ago`].closed 
-            ? issuesPerMonthObject[`${monthsAgo} months ago`].closed = 0 
-            : null
+router.get("/:owner/:repo/events/getEvents", authenticateUser, async (req, res, next) => {
+  try {
+    const { owner, repo } = req.params;
+    const octokit = octokitMain(req.user.githubAccessToken);
+    const allEvents = await paginateLimited(
+      octokit,
+      "GET /repos/{owner}/{repo}/issues/events",
+      { owner, repo },
+      3
+    );
+    res.json({ allEvents });
+  } catch (error) {
+    console.log("Error in retrieving events", error.message);
+    next(error);
+  }
+});
 
-            !issuesPerMonthObject[`${monthsAgo} months ago`].open 
-            ? issuesPerMonthObject[`${monthsAgo} months ago`].open = 0 
-            : null
-
-            monthsAgo++;
-            toDate.setDate(toDate.getDate() - 30);
-        }
-        
-        res.json(issuesPerMonthObject);
-
-    } catch (error) {
-        console.log("Error in retrieving issue timeline",error)
-        next(error);
-    }
-})
-
-//get timeline of issues (open/closed/all) of issues over past week
-router.get("/:owner/:repo/timeline/pastWeek",authenticateUser,async(req,res,next)=>{
-    try {
-        const { owner, repo } = req.params;
-        const octokit =  octokitMain(req.user.githubAccessToken)
-        const responseAll = await octokit.paginate('GET /repos/:owner/:repo/issues?state=all', {
-            owner,
-            repo,
-            per_page: 100,
-        });
-
-        const toDate = new Date();
-        console.log(toDate);
-
-        const issuesPerDayObject = {
-            "0 days ago" : {},
-            "1 days ago" : {},
-            "2 days ago" : {},
-            "3 days ago" : {},
-            "4 days ago" : {},
-            "5 days ago" : {},
-            "6 days ago" : {},
-            "7 days ago" : {},
-        };
-
-        let daysAgo = 0;
-
-        while (daysAgo <=  7){
-            responseAll.map(issue => {
-                issueCreationDate = new Date(issue.created_at);
-        
-                if (issueCreationDate <= toDate){
-                    if (issue.state === "closed" && new Date (issue.closed_at) <= toDate ) {
-                        if ("closed" in issuesPerDayObject[`${daysAgo} days ago`]){
-                            issuesPerDayObject[`${daysAgo} days ago`].closed++;
-                        }
-                        else {
-                            issuesPerDayObject[`${daysAgo} days ago`].closed = 1;
-                        }
-                    }
-                    else{
-                        if ("open" in issuesPerDayObject[`${daysAgo} days ago`]){
-                            issuesPerDayObject[`${daysAgo} days ago`].open++;
-                        }
-                        else {
-                            issuesPerDayObject[`${daysAgo} days ago`].open = 1;
-                        }
-                    }
-                }
-
-            }) //end map
-            issuesPerDayObject[`${daysAgo} days ago`].all = 
-            (issuesPerDayObject[`${daysAgo} days ago`].closed || 0) + 
-            (issuesPerDayObject[`${daysAgo} days ago`].open || 0);
-
-            !issuesPerDayObject[`${daysAgo} days ago`].closed 
-            ? issuesPerDayObject[`${daysAgo} days ago`].closed = 0 
-            : null
-
-            !issuesPerDayObject[`${daysAgo} days ago`].open 
-            ? issuesPerDayObject[`${daysAgo} days ago`].open = 0 
-            : null
-
-            daysAgo++;
-            toDate.setDate(toDate.getDate() - 1);
-            console.log(toDate);
-        }
-        
-        res.json(issuesPerDayObject);
-
-    } catch (error) {
-        console.log("Error in average route",error)
-        next(error);
-    }
-})
-
-//get list of repository issues --> can also get count from this by just taking length
-// note: state = open, closed, OR all
-router.get("/:owner/:repo/:state",authenticateUser,async(req,res,next)=>{
-    try {
-        const { owner, repo, state } = req.params;
-        const octokit =  octokitMain(req.user.githubAccessToken)
-        const response = await octokit.paginate('GET /repos/:owner/:repo/issues?state=:state', {
-            owner,
-            repo,
-            state,
-            per_page: 100,
-        });
-        const allIssues=response
-        
-        res.json({
-            issues:allIssues
-        });
-    } catch (error) {
-        console.log("Error in retrieving issue timeline",error)
-        next(error);
-    }
-})
-
-
-router.get("/:owner/:repo/events/getEvents",authenticateUser,async(req,res,next)=>{
-    try {
-        const { owner, repo, state } = req.params;
-        const octokit =  octokitMain(req.user.githubAccessToken)
-        const response = await octokit.paginate('GET /repos/:owner/:repo/issues/events', {
-            owner,
-            repo,
-            state,
-            per_page: 100,
-        });
-        const allEvents=response
-        
-        res.json({
-            allEvents
-        });
-    } catch (error) {
-        console.log("Error in retrieving events",error)
-        next(error);
-    }
-})
-
-module.exports=router
+module.exports = router;
