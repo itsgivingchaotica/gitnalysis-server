@@ -1,10 +1,15 @@
+// LOCAL DEVELOPMENT ONLY.
+// This script DROPS AND RECREATES every table (users, sessions, repos, branches)
+// and fills them with fake data. Never run it against the production database
+// or in Render's start command.
 const db = require("./db");
 const { User, Repo, Branch } = require("./db/models");
 
 const seedUsers = [
   {
     githubID: 91538619,
-    githubAccessToken: "gho_rY8mWZPo6GS8frnIjPtlkKJDGYRPXC1kimDO",
+    // fake value: never put a real GitHub token in this file
+    githubAccessToken: "fake-token-for-local-dev",
     profilePhoto: "https://avatars.githubusercontent.com/u/105296511?v=4",
     fullName: "John Smith",
     username: "johsmith104",
