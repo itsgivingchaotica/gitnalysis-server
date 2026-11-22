@@ -6,7 +6,9 @@ const { cached, userKey, paginateLimited } = require("../services/github");
 // mounted on : /api/stars
 
 // get the 50 most recent stargazers of a repo, plus the total count.
-// (GitHub won't let you page through all stargazers of a popular repo.)
+// GitHub hides the stargazer list for most repos the user doesn't own (the
+// list comes back empty with totalCount 0), so the total comes from
+// stargazerCount, which is always available. `stargazers` may be [].
 router.get("/:owner/:repo/stargazers", authenticateUser, async (req, res, next) => {
   try {
     const { owner, repo } = req.params;
@@ -16,8 +18,8 @@ router.get("/:owner/:repo/stargazers", authenticateUser, async (req, res, next) 
       const { repository } = await octokit.graphql(
         `query ($owner: String!, $name: String!) {
           repository(owner: $owner, name: $name) {
+            stargazerCount
             stargazers(first: 50, orderBy: { field: STARRED_AT, direction: DESC }) {
-              totalCount
               nodes { login avatarUrl url }
             }
           }
@@ -25,7 +27,7 @@ router.get("/:owner/:repo/stargazers", authenticateUser, async (req, res, next) 
         { owner, name: repo }
       );
       return {
-        count: repository.stargazers.totalCount,
+        count: repository.stargazerCount,
         stargazers: repository.stargazers.nodes.map((s) => ({
           username: s.login,
           avatarUrl: s.avatarUrl,
