@@ -1,285 +1,146 @@
 const router = require("express").Router();
 const octokitMain = require("../services/octokit");
 const authenticateUser = require("../middleware/auth");
-// mounted on: "http://localhost:8080/api/deployments"
+const { getRepoCounts, cached, userKey, daysForRange } = require("../services/github");
 
-//note: the following routes still cannot be fully checkes as no deployments have been made yet
+// mounted on: /api/deployments
+//
+// Many repos (express included) never use GitHub Deployments. Every route here
+// returns a normal 200 response with null / 0 values in that case instead of
+// an error, so the dashboard can show "No deployments".
 
-//get the total number of deployments linked to a repo
-router.get(
-  "/:owner/:repo/count/getNum",
-  authenticateUser,
-  async (req, res, next) => {
-    try {
-      const owner = req.params.owner;
-      const repo = req.params.repo;
-
-      const octokit = octokitMain(req.user.githubAccessToken);
-      const response = await octokit.paginate(
-        "GET /repos/:owner/:repo/deployments",
-        {
-          owner,
-          repo,
-          per_page: 100,
+// The 100 most recent deployments with their statuses, in one GraphQL call.
+function getRecentDeployments(req, octokit, owner, repo) {
+  return cached(userKey(req, "deployments", owner, repo), async () => {
+    const { repository } = await octokit.graphql(
+      `query ($owner: String!, $name: String!) {
+        repository(owner: $owner, name: $name) {
+          deployments(last: 100) {
+            nodes {
+              createdAt
+              statuses(first: 20) { nodes { state createdAt } }
+            }
+          }
         }
-      );
-      const allDeployments = response;
+      }`,
+      { owner, name: repo }
+    );
+    return repository.deployments.nodes
+      .map((d) => ({
+        createdAt: d.createdAt,
+        statuses: d.statuses.nodes
+          .map((s) => ({ state: s.state.toLowerCase(), createdAt: s.createdAt }))
+          .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt)),
+      }))
+      .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  });
+}
 
-      res.json({
-        numDeployments: allDeployments.length,
-      });
-    } catch (error) {
-      console.log("Error in retrieving num of deployments", error);
-      next(error);
-    }
+const isFailure = (state) => state === "failure" || state === "error";
+
+// get the total number of deployments linked to a repo
+router.get("/:owner/:repo/count/getNum", authenticateUser, async (req, res, next) => {
+  try {
+    const { owner, repo } = req.params;
+    const octokit = octokitMain(req.user.githubAccessToken);
+    const counts = await getRepoCounts(req, octokit, owner, repo);
+    res.json({ numDeployments: counts.deployments });
+  } catch (error) {
+    console.log("Error in retrieving num of deployments", error.message);
+    next(error);
   }
-);
+});
 
-//get the total number of deployments linked to a repo over the past week or month
-//note:  param timeRange should be strings: pastDay, pastWeek, pastMonth OR pastYear
-// returns object ex:
-// {
-//     "numDeploymentsInRange": 2,
-//     "deploymentFrequency": 0.06666666666666667,
-//     "deploymentsPerDayObject": {
-//         "2023-07-31": 2
-//     },
-//     "fromDate": "2023-07-12T04:06:26.263Z",
-//     "toDate": "2023-08-11T04:06:26.263Z"
-// }
+// number of deployments over a time range (pastDay/pastWeek/pastMonth/pastYear)
 router.get(
   "/:owner/:repo/deploymentFrequency/:timeRange",
   authenticateUser,
   async (req, res, next) => {
     try {
-      const owner = req.params.owner;
-      const repo = req.params.repo;
-      const timeRange = req.params.timeRange;
-
+      const { owner, repo, timeRange } = req.params;
+      const daysAgo = daysForRange(timeRange);
       const octokit = octokitMain(req.user.githubAccessToken);
-      const response = await octokit.paginate(
-        "GET /repos/:owner/:repo/deployments",
-        {
-          owner,
-          repo,
-          per_page: 100,
-        }
-      );
+      const deployments = await getRecentDeployments(req, octokit, owner, repo);
 
-      const allDeployments = response;
-
-      const currentDate = new Date();
+      const toDate = new Date();
       const fromDate = new Date();
-      let daysAgo = null;
+      fromDate.setDate(toDate.getDate() - daysAgo);
 
-      timeRange === "pastDay"
-        ? (daysAgo = 1)
-        : timeRange === "pastWeek"
-        ? (daysAgo = 7)
-        : timeRange === "pastMonth"
-        ? (daysAgo = 30)
-        : timeRange === "pastYear"
-        ? (daysAgo = 365)
-        : null;
-
-      fromDate.setDate(currentDate.getDate() - daysAgo);
-      console.log(fromDate);
-
-      //filtering the data array based on the date range
-
-      const filteredDeployments = allDeployments.filter(
-        (deployment) =>
-          new Date(deployment.created_at) >= fromDate &&
-          new Date(deployment.created_at) <= currentDate
-      );
+      const inRange = deployments.filter((d) => {
+        const created = new Date(d.createdAt);
+        return created >= fromDate && created <= toDate;
+      });
 
       const deploymentsPerDayObject = {};
+      for (const d of inRange) {
+        const day = d.createdAt.split("T")[0];
+        deploymentsPerDayObject[day] = (deploymentsPerDayObject[day] || 0) + 1;
+      }
 
-      filteredDeployments.map((deployment) => {
-        const deploymentDate = new Date(deployment.created_at); //formatted as a dateTime, need to get only date
-        const year = deploymentDate.getFullYear();
-        const month = deploymentDate.getMonth() + 1; // Months are zero-based, so add 1
-        const day = deploymentDate.getDate();
-        const formattedDate = `${year}-${month
-          .toString()
-          .padStart(2, "0")}-${day.toString().padStart(2, "0")}`;
-
-        if (formattedDate in deploymentsPerDayObject) {
-          deploymentsPerDayObject[formattedDate]++;
-        } else {
-          deploymentsPerDayObject[formattedDate] = 1;
-        }
-      });
-
-      // res.json(filteredDeployments);
       res.json({
-        numDeploymentsInRange: filteredDeployments.length,
-        deploymentFrequency: filteredDeployments.length / daysAgo,
+        numDeploymentsInRange: inRange.length,
+        deploymentFrequency: inRange.length / daysAgo,
         deploymentsPerDayObject,
         fromDate,
-        toDate: currentDate,
+        toDate,
       });
     } catch (error) {
-      console.log("Error in retrieving deployment frequency", error);
+      console.log("Error in retrieving deployment frequency", error.message);
       next(error);
     }
   }
 );
 
-async function calculateCFR(owner, repo, accesstoken) {
+// Change Failure Rate: % of recent deployments that had a failed status.
+// Returns a number (e.g. 12.5), or null if the repo has no deployments.
+router.get("/:owner/:repo/cfr", authenticateUser, async (req, res, next) => {
   try {
-    const octokit = octokitMain(accesstoken);
-    const deploymentsResponse = await octokit(
-      "GET /repos/:owner/:repo/deployments",
-      {
-        owner,
-        repo,
-      }
-    );
-    const deployments = deploymentsResponse;
+    const { owner, repo } = req.params;
+    const octokit = octokitMain(req.user.githubAccessToken);
+    const deployments = await getRecentDeployments(req, octokit, owner, repo);
 
-    const failedDeployments = [];
+    if (deployments.length === 0) return res.json(null);
 
-    // iterate through deployments and get their statuses
-    for (const deployment of deployments) {
-      const octokit = octokitMain(accesstoken);
-      const deploymentStatuses = await octokit.repos.listDeploymentStatuses({
-        owner: owner,
-        repo: repo,
-        deployment_id: deployment.id,
-      });
-
-      const hasFailedStatus = deploymentStatuses.data.some(
-        (status) => status.state === "failure"
-      );
-
-      if (hasFailedStatus) {
-        failedDeployments.push(deployment);
-      }
-    }
-
-    // calculate CFR: (failed deployments / total deployments) * 100 %
-    const totalDeployments = deployments.length;
-
-    if (totalDeployments === 0) {
-      return "No deployments available.";
-    }
-
-    const totalFailedDeployments = failedDeployments.length;
-
-    const cfr = (totalFailedDeployments / totalDeployments) * 100;
-
-    // returns CFR with two decimal places
-    return cfr.toFixed(2);
+    const failed = deployments.filter((d) => d.statuses.some((s) => isFailure(s.state)));
+    res.json(parseFloat(((failed.length / deployments.length) * 100).toFixed(2)));
   } catch (error) {
-    console.error("Error:", error.message);
-    throw error;
-  }
-}
-
-// route to get Change Failure Rate (CFR)
-router.get("/:owner/:repo/cfr", authenticateUser, async (req, res) => {
-  const owner = req.params.owner;
-  const repo = req.params.repo;
-
-  try {
-    const cfr = await calculateCFR(owner, repo, req.user.githubAccessToken);
-    res.json(cfr);
-  } catch (error) {
-    console.log(error);
-    res.status(500).json({ error: "An error occurred while calculating CFR." });
+    console.log("Error calculating CFR", error.message);
+    next(error);
   }
 });
 
-// Define a route to calculate MTTR for a given repository
-router.get("/:owner/:repo/mttr", authenticateUser, async (req, res) => {
+// Mean Time To Recovery: average time between a failed deployment status and
+// the next successful one. { mttr: hours } or { mttr: null, message } if there
+// is nothing to measure.
+router.get("/:owner/:repo/mttr", authenticateUser, async (req, res, next) => {
   try {
-    const octokit = octokitMain(req.user.githubAccessToken);
     const { owner, repo } = req.params;
+    const octokit = octokitMain(req.user.githubAccessToken);
+    const deployments = await getRecentDeployments(req, octokit, owner, repo);
 
-    // Fetch deployment statuses for the specified repository
-    const response = await octokit.repos.listDeploymentStatuses(
-      "GET /repos/:owner/:repo/deployments",
-      {
-        owner,
-        repo,
-        per_page: 82,
-      }
-    );
-    const deployments = response;
-
-    // Return an error if no deployments are found
-    if (!deployments || !deployments.data) {
-      return res.status(404).send("No deployments found for the repository.");
+    if (deployments.length === 0) {
+      return res.json({ mttr: null, message: "No deployments found." });
     }
 
-    // Sort deployments by creation date
-    deployments.data.sort((a, b) => {
-      return (
-        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-      );
-    });
-
-    // Initialize arrays to store MTTR data and all statuses
-    const mttrData = [];
-    const allStatuses = [];
-
-    // Iterate through each deployment to fetch and sort its statuses
-    for (let deployment of deployments.data) {
-      const { statuses_url } = deployment;
-
-      // Fetch deployment statuses
-      const statusesResponse = await octokit.request(statuses_url, {
-        method: "GET",
-      });
-
-      // Sort statuses by creation date
-      const sortedStatuses = [...statusesResponse.data].sort((a, b) => {
-        return (
-          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-        );
-      });
-
-      // Add sorted statuses to the array all statuses
-      allStatuses.push(...sortedStatuses);
-
-      // console.log("status", sortedStatuses);
-    }
-
-    // Loop through all statuses to detect failures and subsequent recoveries
+    const allStatuses = deployments.flatMap((d) => d.statuses);
+    const recoveryTimes = [];
     for (let i = 0; i < allStatuses.length - 1; i++) {
-      const currentStatus = allStatuses[i].state;
-      // console.log("curr Status", currentStatus);
-      const nextStatus = allStatuses[i + 1].state;
-      // console.log("next Status", nextStatus);
-
-      // If a failure is followed by a success, calculate the time difference
-      if (currentStatus === "failure" && nextStatus === "success") {
-        const failedAt = new Date(allStatuses[i].created_at).getTime();
-        const restoredAt = new Date(allStatuses[i + 1].created_at).getTime();
-
-        const restoreTime = restoredAt - failedAt;
-        mttrData.push(restoreTime);
+      if (isFailure(allStatuses[i].state) && allStatuses[i + 1].state === "success") {
+        recoveryTimes.push(
+          new Date(allStatuses[i + 1].createdAt) - new Date(allStatuses[i].createdAt)
+        );
       }
     }
 
-    // Calculate the average recovery time from all recovery periods
-    const totalRestoreTime = mttrData.reduce((acc, time) => acc + time, 0);
-    console.log(mttrData.length);
-
-    // Handle the scenario when no recoveries are found
-    if (mttrData.length === 0) {
-      return res.status(400).send("No recoveries found to calculate MTTR.");
+    if (recoveryTimes.length === 0) {
+      return res.json({ mttr: null, message: "No failures to recover from." });
     }
 
-    // Calculate MTTR
-    const mttr = totalRestoreTime / mttrData.length;
-    console.log(mttr);
-
-    // Return MTTR value in hours
-    res.json({ mttr: parseFloat((mttr / (1000 * 60 * 60)).toFixed(2)) });
+    const avg = recoveryTimes.reduce((a, b) => a + b, 0) / recoveryTimes.length;
+    res.json({ mttr: parseFloat((avg / (1000 * 60 * 60)).toFixed(2)) });
   } catch (error) {
-    console.error("Error calculating MTTR for deployments:", error);
+    console.error("Error calculating MTTR", error.message);
+    next(error);
   }
 });
 

@@ -1,154 +1,85 @@
 const router = require("express").Router();
 const octokitMain = require("../services/octokit");
 const authenticateUser = require("../middleware/auth");
-// mounted on : http://localhost:8080/api/branches
-//note: do not need auth for these routes
+const { cached, userKey, getRepoCounts } = require("../services/github");
+// mounted on : /api/branches
 
-// const NodeCache = require("node-cache");
-// const githubCache = new NodeCache({ stdTTL: 1800 }); // 1800 seconds = 30 minutes
-
-//get all branches linke to a repo (all branch data including name) returned in sorted order by date created
+// get the 100 most recently updated branches, newest first
 // ex response
 // "branches": [
 //     {
 //         "name": "cookie-dev",
 //         "commitDate": "2023-08-21T01:01:55Z",
 //         "commitDateNoTime": "2023-08-21"
+//     }, ...
+// ]
+//
+// One GraphQL call instead of one REST call per branch.
 router.get("/:owner/:repo", authenticateUser, async (req, res, next) => {
   try {
-    const owner = req.params.owner;
-    const repo = req.params.repo;
-
-    // const cacheKey = `${owner}-${repo}-branches`;
-    // const cachedData = githubCache.get(cacheKey);
-
-    // if (cachedData) {
-    //   res.json(cachedData);
-    // } else {
+    const { owner, repo } = req.params;
     const octokit = octokitMain(req.user.githubAccessToken);
-    // const response = await octokit.request('GET /repos/:owner/:repo/branches', {
-    //     owner,
-    //     repo
-    // });
-    // const all_branches=response.data
-    const response = await octokit.paginate(
-      "GET /repos/:owner/:repo/branches",
-      {
-        owner,
-        repo,
-        per_page: 100,
-      }
-    );
 
-    const all_branches = await Promise.all(
-      response.map(async (branch) => {
-        const commitDetails = await octokit.request(
-          `GET /repos/:owner/:repo/git/commits/:commit_sha`,
-          {
-            owner,
-            repo,
-            commit_sha: branch.commit.sha,
+    const branches = await cached(userKey(req, "branches", owner, repo), async () => {
+      const { repository } = await octokit.graphql(
+        `query ($owner: String!, $name: String!) {
+          repository(owner: $owner, name: $name) {
+            refs(refPrefix: "refs/heads/", first: 100,
+                 orderBy: { field: TAG_COMMIT_DATE, direction: DESC }) {
+              nodes {
+                name
+                target { ... on Commit { committedDate } }
+              }
+            }
           }
-        );
-        return {
-          name: branch.name,
-          commitDate: commitDetails.data.committer.date,
-          commitDateNoTime: new Date(commitDetails.data.committer.date)
-            .toISOString()
-            .split("T")[0],
-        };
-      })
-    );
-
-    const sortedBranches = all_branches.sort(
-      (a, b) => new Date(b.commitDate) - new Date(a.commitDate)
-    );
-
-    // githubCache.set(cacheKey, { branches: sortedBranches }, 1800);
-
-    res.json({
-      branches: sortedBranches,
+        }`,
+        { owner, name: repo }
+      );
+      return repository.refs.nodes
+        .filter((ref) => ref.target && ref.target.committedDate)
+        .map((ref) => ({
+          name: ref.name,
+          commitDate: ref.target.committedDate,
+          commitDateNoTime: ref.target.committedDate.split("T")[0],
+        }))
+        .sort((a, b) => new Date(b.commitDate) - new Date(a.commitDate));
     });
-    // }
+
+    res.json({ branches });
   } catch (error) {
-    console.log("Error in retrieving branches", error);
+    console.log("Error in retrieving branches", error.message);
     next(error);
   }
 });
 
-//get number of branches (count) linked to a repo
+// get number of branches linked to a repo
 router.get("/count/:owner/:repo", authenticateUser, async (req, res, next) => {
   try {
-    const owner = req.params.owner;
-    const repo = req.params.repo;
-
-    // const cacheKey = `${owner}-${repo}-branchcount`;
-    // const cachedData = githubCache.get(cacheKey);
-
-    // if (cachedData) {
-    //   res.json(cachedData);
-    // } else {
+    const { owner, repo } = req.params;
     const octokit = octokitMain(req.user.githubAccessToken);
-    const response = await octokit.paginate(
-      "GET /repos/:owner/:repo/branches",
-      {
-        owner,
-        repo,
-        per_page: 100,
-      }
-    );
-    const all_branches = response;
-
-    // githubCache.set(cacheKey, { branches: all_branches.length }, 1800);
-
-    res.json({
-      branches: all_branches.length,
-    });
-    // }
+    const counts = await getRepoCounts(req, octokit, owner, repo);
+    res.json({ branches: counts.branches });
   } catch (error) {
-    console.log("Error in retrieving num of branches", error);
+    console.log("Error in retrieving num of branches", error.message);
     next(error);
   }
 });
 
-//get all data for an individual branch linked to a repo
-router.get(
-  "/singleBranch/:owner/:repo/:branch",
-  authenticateUser,
-  async (req, res, next) => {
-    try {
-      const owner = req.params.owner;
-      const repo = req.params.repo;
-      const branch = req.params.branch;
-
-      // const cacheKey = `${owner}-${repo}-${branch}`;
-      // const cachedData = githubCache.get(cacheKey);
-
-      // if (cachedData) {
-      //   res.json(cachedData);
-      // } else {
-      const octokit = octokitMain(req.user.githubAccessToken);
-      const response = await octokit.request(
-        "GET /repos/:owner/:repo/branches/:branch",
-        {
-          owner,
-          repo,
-          branch,
-        }
-      );
-      const branchResponse = response.data;
-
-      // githubCache.set(cacheKey, { branch: branchResponse }, 1800);
-
-      res.json({
-        branch: branchResponse,
-      });
-      // }
-    } catch (error) {
-      console.log("Error in average route", error);
-      next(error);
-    }
+// get all data for an individual branch linked to a repo
+router.get("/singleBranch/:owner/:repo/:branch", authenticateUser, async (req, res, next) => {
+  try {
+    const { owner, repo, branch } = req.params;
+    const octokit = octokitMain(req.user.githubAccessToken);
+    const response = await octokit.request("GET /repos/{owner}/{repo}/branches/{branch}", {
+      owner,
+      repo,
+      branch,
+    });
+    res.json({ branch: response.data });
+  } catch (error) {
+    console.log("Error in single branch route", error.message);
+    next(error);
   }
-);
+});
 
 module.exports = router;

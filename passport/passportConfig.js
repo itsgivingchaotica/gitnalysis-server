@@ -45,14 +45,24 @@ module.exports = (passport) => {
               githubID: profile.id,
               githubAccessToken: accessToken,
               username: profile.username,
-              fullname: profile.displayName,
+              fullName: profile.displayName,
               profilePhoto: profile._json.avatar_url,
             });
             return done(null, newUser);
           }
+          // Always save the fresh token from this login. Previously the token
+          // from the user's first-ever login was kept forever, and GitHub
+          // revokes OAuth tokens that go unused for a year -> 401s everywhere.
+          await user.update({
+            githubAccessToken: accessToken,
+            username: profile.username,
+            fullName: profile.displayName,
+            profilePhoto: profile._json.avatar_url,
+          });
           return done(null, user);
         } catch (error) {
-          console.log("Error in Stategy");
+          console.log("Error in GitHub strategy", error.message);
+          return done(error);
         }
       }
     )

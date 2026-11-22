@@ -4,6 +4,7 @@ const authenticateUser = require("../middleware/auth");
 const { calcTimeAgo } = require("../services/helperFunctions");
 const { Repo } = require("../db/models");
 const { User } = require("../db/models");
+const { paginateLimited, cached, userKey, mapLimit } = require("../services/github");
 
 // mounted on : http://localhost:8080/api/repos
 
@@ -165,16 +166,13 @@ router.get(
     try {
       const { owner, repo, timePeriod } = req.params;
       const octokit = octokitMain(req.user.githubAccessToken);
-      const response = await octokit.paginate(
-        "GET /repos/:owner/:repo/activity?time_period=:timePeriod",
-        {
-          owner,
-          repo,
-          timePeriod,
-          per_page: 100,
-        }
+      // capped at 1,000 events so huge repos don't exhaust memory
+      const repoActivityData = await paginateLimited(
+        octokit,
+        "GET /repos/{owner}/{repo}/activity",
+        { owner, repo, time_period: timePeriod },
+        10
       );
-      const repoActivityData = response;
 
       let repoActivityArray = [];
 
@@ -291,6 +289,9 @@ router.get(
           repoActivityArray,
           activitiesTimelineChartObject: activitiesPerMonthObject,
         });
+      } else {
+        // "day" / "quarter": no chart buckets, but always respond
+        res.json({ repoActivityArray, activitiesTimelineChartObject: {} });
       }
     } catch (error) {
       console.log("Error in retrieving repo activity", error);
@@ -299,72 +300,78 @@ router.get(
   }
 );
 
-/* recursively travels through directories in given repo to calculate
- * overall comment-per-code ratio
+/* comment-per-code ratio for a repo.
+ * Lists the whole file tree in one call, then samples up to 60 source files
+ * (instead of downloading every file, which burns the GitHub rate limit on big
+ * repos).
  */
+const CODE_FILE = /\.(js|jsx|ts|tsx|py|java|cpp|c|h|php|html|css|rb|go|rs)$/i;
+const SKIP_PATH = /(^|\/)(node_modules|vendor|dist|build|coverage|\.next)\/|\.min\.js$/i;
+const MAX_FILES = 60;
+
 router.get(
   "/comments-per-code/:owner/:repo",
   authenticateUser,
-  async (req, res) => {
+  async (req, res, next) => {
     try {
-      const owner = req.params.owner;
-      const repo = req.params.repo;
+      const { owner, repo } = req.params;
       const octokit = octokitMain(req.user.githubAccessToken);
 
-      const calculateCommentsPerCode = async (path) => {
-        const contentsResponse = await octokit.repos.getContent({
-          owner: owner,
-          repo: repo,
-          path: path,
+      const result = await cached(userKey(req, "comments-per-code", owner, repo), async () => {
+        const { data: repoData } = await octokit.request("GET /repos/{owner}/{repo}", {
+          owner,
+          repo,
+        });
+        const { data: tree } = await octokit.request(
+          "GET /repos/{owner}/{repo}/git/trees/{tree_sha}",
+          { owner, repo, tree_sha: repoData.default_branch, recursive: "1" }
+        );
+
+        const codeFiles = tree.tree.filter(
+          (item) =>
+            item.type === "blob" &&
+            CODE_FILE.test(item.path) &&
+            !SKIP_PATH.test(item.path) &&
+            (item.size || 0) < 200000
+        );
+        const sample = codeFiles.slice(0, MAX_FILES);
+
+        let linesOfCode = 0;
+        let linesOfComments = 0;
+        await mapLimit(sample, 6, async (file) => {
+          const { data: blob } = await octokit.request(
+            "GET /repos/{owner}/{repo}/git/blobs/{file_sha}",
+            { owner, repo, file_sha: file.sha }
+          );
+          const counts = getCodeAndComments(blob.content);
+          linesOfCode += counts.linesOfCode;
+          linesOfComments += counts.linesOfComments;
         });
 
-        let totalLinesOfCode = 0;
-        let totalLinesOfComments = 0;
-
-        for (const content of contentsResponse.data) {
-          const fileExtensionRegex = /\.(js|py|java|cpp|php|html|css|rb|jsx)$/i;
-          if (
-            content.type === "file" &&
-            fileExtensionRegex.test(content.name)
-          ) {
-            const fileContent = await octokit.request(
-              "GET /repos/:owner/:repo/contents/:path",
-              {
-                owner: owner,
-                repo: repo,
-                path: content.path,
-              }
-            );
-
-            const codeAndComments = getCodeAndComments(
-              fileContent.data.content
-            );
-            totalLinesOfCode += codeAndComments.linesOfCode;
-            totalLinesOfComments += codeAndComments.linesOfComments;
-          } else if (content.type === "dir") {
-            const dirMetrics = await calculateCommentsPerCode(content.path);
-            totalLinesOfCode += dirMetrics.linesOfCode;
-            totalLinesOfComments += dirMetrics.linesOfComments;
-          }
-        }
-
         return {
-          linesOfCode: totalLinesOfCode,
-          linesOfComments: totalLinesOfComments,
+          totalLinesOfCode: linesOfCode,
+          totalLinesOfComments: linesOfComments,
+          commentsPerCodeRatio:
+            linesOfCode > 0 ? (linesOfComments / linesOfCode).toFixed(2) : "0.00",
+          filesAnalyzed: sample.length,
+          totalCodeFiles: codeFiles.length,
         };
-      };
-
-      const result = await calculateCommentsPerCode("");
-      const commentsPerCodeRatio = result.linesOfComments / result.linesOfCode;
-
-      res.json({
-        totalLinesOfCode: result.linesOfCode,
-        totalLinesOfComments: result.linesOfComments,
-        commentsPerCodeRatio: commentsPerCodeRatio.toFixed(2),
       });
+
+      res.json(result);
     } catch (error) {
-      console.error("Error:", error.message);
-      res.status(500).json({ error: "An error occurred" });
+      // empty repos have no tree (409)
+      if (error.status === 409) {
+        return res.json({
+          totalLinesOfCode: 0,
+          totalLinesOfComments: 0,
+          commentsPerCodeRatio: "0.00",
+          filesAnalyzed: 0,
+          totalCodeFiles: 0,
+        });
+      }
+      console.error("Error in comments-per-code:", error.message);
+      next(error);
     }
   }
 );
@@ -413,7 +420,7 @@ router.get(
     try {
       const { owner, repo } = req.params;
       const octokit = octokitMain(req.user.githubAccessToken);
-      const responseAll = await octokit.paginate(
+      const responseAll = await paginateLimited(octokit, 
         "GET /repos/:owner/:repo/issues?state=all",
         {
           owner,
@@ -489,7 +496,7 @@ router.get(
     try {
       const { owner, repo } = req.params;
       const octokit = octokitMain(req.user.githubAccessToken);
-      const responseAll = await octokit.paginate(
+      const responseAll = await paginateLimited(octokit, 
         "GET /repos/:owner/:repo/issues?state=all",
         {
           owner,
@@ -573,7 +580,7 @@ router.get(
     try {
       const { owner, repo } = req.params;
       const octokit = octokitMain(req.user.githubAccessToken);
-      const responseAll = await octokit.paginate(
+      const responseAll = await paginateLimited(octokit, 
         "GET /repos/:owner/:repo/issues?state=all",
         {
           owner,

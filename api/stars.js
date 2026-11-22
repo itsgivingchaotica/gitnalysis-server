@@ -1,108 +1,67 @@
 const router = require("express").Router();
 const octokitMain = require("../services/octokit");
 const authenticateUser = require("../middleware/auth");
-// mounted on : http://localhost:8080/api/stars
-//note: do not need auth for these routes
+const { cached, userKey, paginateLimited } = require("../services/github");
 
-//get all stargazers of a repo
-router.get(
-  "/:owner/:repo/stargazers",
-  authenticateUser,
-  async (req, res, next) => {
-    try {
-      const owner = req.params.owner;
-      const repo = req.params.repo;
+// mounted on : /api/stars
 
-      const octokit = octokitMain(req.user.githubAccessToken);
+// get the 50 most recent stargazers of a repo, plus the total count.
+// GitHub hides the stargazer list for most repos the user doesn't own (the
+// list comes back empty with totalCount 0), so the total comes from
+// stargazerCount, which is always available. `stargazers` may be [].
+router.get("/:owner/:repo/stargazers", authenticateUser, async (req, res, next) => {
+  try {
+    const { owner, repo } = req.params;
+    const octokit = octokitMain(req.user.githubAccessToken);
 
-      const response = await octokit.paginate(
-        "GET /repos/:owner/:repo/stargazers",
-        {
-          owner,
-          repo,
-          per_page: 100,
-        }
+    const result = await cached(userKey(req, "stargazers", owner, repo), async () => {
+      const { repository } = await octokit.graphql(
+        `query ($owner: String!, $name: String!) {
+          repository(owner: $owner, name: $name) {
+            stargazerCount
+            stargazers(first: 50, orderBy: { field: STARRED_AT, direction: DESC }) {
+              nodes { login avatarUrl url }
+            }
+          }
+        }`,
+        { owner, name: repo }
       );
+      return {
+        count: repository.stargazerCount,
+        stargazers: repository.stargazers.nodes.map((s) => ({
+          username: s.login,
+          avatarUrl: s.avatarUrl,
+          profileUrl: s.url,
+        })),
+      };
+    });
 
-      const responseArray = [];
-
-      for (const stargazer of response) {
-        responseArray.push({
-          username: stargazer.login,
-          avatarUrl: stargazer.avatar_url,
-          profileUrl: stargazer.url,
-        });
-      }
-
-      res.json({
-        stargazers: responseArray,
-      });
-    } catch (error) {
-      console.log("Error in repo stargazers", error);
-      next(error);
-    }
+    res.json(result);
+  } catch (error) {
+    console.log("Error in repo stargazers", error.message);
+    next(error);
   }
-);
+});
 
-//get authenticated users starred repos
+// get the authenticated user's starred repos (capped at 500)
 router.get("/me/starred", authenticateUser, async (req, res, next) => {
   try {
     const octokit = octokitMain(req.user.githubAccessToken);
-    const response = await octokit.paginate("GET /user/starred", {
-      per_page: 100,
-    });
-
-    const responseArray = [];
-    for (const starredRepo of response) {
-      responseArray.push({
+    const starred = await paginateLimited(octokit, "GET /user/starred", {}, 5);
+    res.json({
+      starredRepos: starred.map((starredRepo) => ({
         name: starredRepo.name,
         full_name: starredRepo.full_name,
         url: starredRepo.url,
         owner: starredRepo.owner.login,
         ownerAvatarUrl: starredRepo.owner.avatar_url,
         ownerProfileUrl: starredRepo.owner.url,
-      });
-    }
-    res.json({
-      starredRepos: responseArray,
+      })),
     });
   } catch (error) {
-    console.log("Error in starred repos", error);
+    console.log("Error in starred repos", error.message);
     next(error);
   }
 });
-
-//FOLLOWING BRANCH CURRENTLY NOT WORKING
-//get user starred repos by username
-// router.get("/:username/starred/",authenticateUser,async(req,res,next)=>{
-//     const username = req.params.username;
-//     try {
-
-//         const octokit =  octokitMain(req.user.githubAccessToken)
-//         const response = await octokit.paginate('GET /users/:username/starred}', {
-//             username,
-//             per_page: 100,
-//         });
-
-//         const responseArray = [];
-//         for (const starredRepo of response){
-//             responseArray.push({
-//                 name: starredRepo.name,
-//                 fullName: starredRepo.full_name,
-//                 url: starredRepo.url,
-//                 owner: starredRepo.owner.login,
-//                 ownerAvatarUrl: starredRepo.owner.avatar_url,
-//                 ownerProfileUrl: starredRepo.owner.url,
-//             })
-//         }
-//         res.json({
-//             starredRepos: responseArray
-//         });
-//     } catch (error) {
-//         console.log("Error in retrieving num of branches",error)
-//         next(error);
-//     }
-
-// })
 
 module.exports = router;

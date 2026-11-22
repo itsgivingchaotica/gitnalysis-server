@@ -2,6 +2,7 @@ const router = require("express").Router();
 const octokitMain = require("../services/octokit");
 const authenticateUser = require("../middleware/auth");
 const { User } = require("../db/models");
+const { paginateLimited } = require("../services/github");
 
 // mounted on: http://localhost:8080/api/users
 
@@ -38,7 +39,7 @@ router.get("/:username", authenticateUser, async (req, res, next) => {
 router.get("/me/followers", authenticateUser, async (req, res, next) => {
   try {
     const octokit = octokitMain(req.user.githubAccessToken);
-    const response = await octokit.paginate("GET /user/followers", {
+    const response = await paginateLimited(octokit, "GET /user/followers", {
       per_page: 100,
     });
 
@@ -53,7 +54,7 @@ router.get("/me/followers", authenticateUser, async (req, res, next) => {
 router.get("/me/following", authenticateUser, async (req, res, next) => {
   try {
     const octokit = octokitMain(req.user.githubAccessToken);
-    const response = await octokit.paginate("GET /user/following", {
+    const response = await paginateLimited(octokit, "GET /user/following", {
       per_page: 100,
     });
 
@@ -91,7 +92,7 @@ router.get("/:username/followers", authenticateUser, async (req, res, next) => {
     const octokit = octokitMain(req.user.githubAccessToken);
     const username = req.params.username;
 
-    const response = await octokit.paginate("GET /users/:username/followers", {
+    const response = await paginateLimited(octokit, "GET /users/:username/followers", {
       username,
       per_page: 100,
     });
@@ -109,7 +110,7 @@ router.get("/:username/following", authenticateUser, async (req, res, next) => {
     const octokit = octokitMain(req.user.githubAccessToken);
     const username = req.params.username;
 
-    const response = await octokit.paginate("GET /users/:username/following", {
+    const response = await paginateLimited(octokit, "GET /users/:username/following", {
       username,
       per_page: 100,
     });
